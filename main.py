@@ -16,12 +16,11 @@ except ImportError:
 # ============================================================
 N_MARKETS = 70               # how many 5-min windows to watch before stopping
 HIGH_THRESHOLD = 0.70         # side that reaches this first becomes "determining"
-LOW_THRESHOLD = 0.35          # determining side falling back to this = live failure
+SUCCESS_THRESHOLD = 0.96      # determining side reaching this = success
+LOW_THRESHOLD = 0.2            # determining side falling back to this before success = failure
 USE_WEBSOCKET = True          # False = REST polling instead
 VERBOSE = False               # False = only print per-window verdicts, not every tick
 OUTPUT_FILE = "output.txt"    # every print also gets written here
-RESOLUTION_POLL_INTERVAL = 10 # seconds between resolution checks for a pending market
-RESOLUTION_MAX_WAIT = 900     # give up waiting on one market's resolution after this many seconds
 # ============================================================
 
 
@@ -91,61 +90,23 @@ def parse_outcomes(market: dict) -> dict:
     return out
 
 
-def fetch_resolution(slug: str):
-    """Checks the real on-chain resolution via Gamma's events/slug endpoint.
-    Returns 'Up' or 'Down' if the market has actually resolved, or None if
-    it hasn't resolved yet (or the request failed)."""
-    try:
-        r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
-        if not r.ok:
-            return None
-        data = r.json()
-        markets = data.get("markets") or []
-        if not markets:
-            return None
-        m = markets[0]
-        if not m.get("closed") or m.get("umaResolutionStatus") != "resolved":
-            return None
-        outcomes = json.loads(m["outcomes"])
-        prices = json.loads(m.get("outcomePrices", "[]") or "[]")
-        for name, p in zip(outcomes, prices):
-            if float(p) >= 0.5:
-                return name
-        return None
-    except Exception:
-        return None
-
-
-def wait_for_resolution(slug: str, label: str):
-    """Polls fetch_resolution until the market resolves or we give up.
-    Returns 'Up' / 'Down' / None."""
-    start = time.time()
-    while True:
-        outcome = fetch_resolution(slug)
-        if outcome is not None:
-            return outcome
-        elapsed = time.time() - start
-        if elapsed > RESOLUTION_MAX_WAIT:
-            print(f"[{ts_now()}] {label} still not resolved after {int(elapsed)}s, giving up -> UNDETERMINED")
-            return None
-        print(f"[{ts_now()}] {label} not resolved yet, waiting {RESOLUTION_POLL_INTERVAL}s...")
-        time.sleep(RESOLUTION_POLL_INTERVAL)
-
-
 class WindowClassifier:
-    """Whichever side hits HIGH first becomes the 'determining' side.
-    After that, only that side matters: if it ever falls back to LOW,
-    it's an immediate live failure. Otherwise the market is PENDING
-    real resolution, checked separately after the window closes."""
+    """Whichever side hits HIGH_THRESHOLD first becomes the 'determining'
+    side. After that, only that side matters:
+      - if it reaches SUCCESS_THRESHOLD -> success
+      - if it falls back to LOW_THRESHOLD before that -> failure
+      - if the window closes without hitting either -> failure
+    If no side ever reaches HIGH_THRESHOLD, the window is 'undetermined'."""
 
-    def __init__(self, token_up, token_down, high_thresh, low_thresh):
+    def __init__(self, token_up, token_down, high_thresh, success_thresh, low_thresh):
         self.token_up = token_up
         self.token_down = token_down
         self.high = high_thresh
+        self.success_thresh = success_thresh
         self.low = low_thresh
         self.determining_token = None
         self.determining_side = None
-        self.status = None  # None | "failure" (live stop-loss hit)
+        self.status = None  # None | "success" | "failure"
         self.decided_at = None
 
     def update(self, token_id, price, ts):
@@ -161,15 +122,21 @@ class WindowClassifier:
         if token_id != self.determining_token:
             return  # only the determining side matters from here on
 
-        if price <= self.low:
+        if price >= self.success_thresh:
+            self.status = "success"
+            self.decided_at = ts
+        elif price <= self.low:
             self.status = "failure"
             self.decided_at = ts
 
-    def pending_status(self):
-        """Status right after the window closes, before resolution check."""
+    def final_status(self):
+        """Status once the window has closed."""
         if self.status is not None:
-            return self.status  # "failure"
-        return "pending" if self.determining_token is not None else "undetermined"
+            return self.status  # "success" or "failure"
+        if self.determining_token is not None:
+            # reached HIGH_THRESHOLD but never hit success or the stop-loss
+            return "failure"
+        return "undetermined"
 
 
 def stream_window_ws(outcomes, close_ts, classifier, label):
@@ -301,7 +268,7 @@ def wait_for_window(target_ts, label):
 
 def analyze():
     print(f"[{ts_now()}] Starting analysis of {N_MARKETS} markets "
-          f"(high>={HIGH_THRESHOLD}, low<={LOW_THRESHOLD})")
+          f"(trigger>={HIGH_THRESHOLD}, success>={SUCCESS_THRESHOLD}, stop-loss<={LOW_THRESHOLD})")
 
     records = []  # list of dicts: slug, label, determining_side, status
 
@@ -330,7 +297,8 @@ def analyze():
         print(f"[{ts_now()}] {label} Down token: {outcomes['Down']['token_id']}")
 
         classifier = WindowClassifier(
-            outcomes["Up"]["token_id"], outcomes["Down"]["token_id"], HIGH_THRESHOLD, LOW_THRESHOLD
+            outcomes["Up"]["token_id"], outcomes["Down"]["token_id"],
+            HIGH_THRESHOLD, SUCCESS_THRESHOLD, LOW_THRESHOLD
         )
         if outcomes["Up"]["price"] is not None:
             classifier.update(outcomes["Up"]["token_id"], outcomes["Up"]["price"], time.time())
@@ -346,16 +314,19 @@ def analyze():
         else:
             stream_window_poll(outcomes, close_ts, classifier, label)
 
-        status = classifier.pending_status()
+        status = classifier.final_status()
         determining = f" (determining side: {classifier.determining_side})" if classifier.determining_side else ""
 
-        if status == "failure":
-            print(f"[{ts_now()}] {label} >>> RESULT: FAILURE{determining} (stop-loss hit) <<<")
-        elif status == "undetermined":
-            print(f"[{ts_now()}] {label} >>> RESULT: UNDETERMINED (never reached {HIGH_THRESHOLD}) <<<")
+        if status == "success":
+            print(f"[{ts_now()}] {label} >>> RESULT: SUCCESS{determining} (hit {SUCCESS_THRESHOLD}) <<<")
+        elif status == "failure":
+            if classifier.decided_at is not None:
+                print(f"[{ts_now()}] {label} >>> RESULT: FAILURE{determining} (stop-loss hit) <<<")
+            else:
+                print(f"[{ts_now()}] {label} >>> RESULT: FAILURE{determining} "
+                      f"(window closed without reaching {SUCCESS_THRESHOLD}) <<<")
         else:
-            print(f"[{ts_now()}] {label} window closed, never hit stop-loss{determining} "
-                  f"-> pending real resolution")
+            print(f"[{ts_now()}] {label} >>> RESULT: UNDETERMINED (never reached {HIGH_THRESHOLD}) <<<")
 
         records.append({
             "slug": slug,
@@ -363,26 +334,6 @@ def analyze():
             "determining_side": classifier.determining_side,
             "status": status,
         })
-
-    # ------------------------------------------------------------
-    # Second pass: confirm real resolution for every pending market
-    # ------------------------------------------------------------
-    pending = [r for r in records if r["status"] == "pending"]
-    if pending:
-        print(f"\n[{ts_now()}] Confirming real outcomes for {len(pending)} pending market(s)...")
-        for r in pending:
-            outcome = wait_for_resolution(r["slug"], r["label"])
-            if outcome is None:
-                r["status"] = "undetermined"
-                print(f"[{ts_now()}] {r['label']} resolution unknown -> UNDETERMINED")
-            elif outcome == r["determining_side"]:
-                r["status"] = "success"
-                print(f"[{ts_now()}] {r['label']} resolved {outcome}, matches determining side "
-                      f"({r['determining_side']}) -> SUCCESS")
-            else:
-                r["status"] = "failure"
-                print(f"[{ts_now()}] {r['label']} resolved {outcome}, determining side was "
-                      f"{r['determining_side']} -> FAILURE")
 
     return [(r["status"], r["slug"]) for r in records]
 
