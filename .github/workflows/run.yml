@@ -1,1 +1,43 @@
-.
+name: Run Gamma Script
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run script
+        run: |
+          python main.py
+
+      - name: Show files
+        run: |
+          echo "Current directory:"
+          pwd
+          echo ""
+          echo "Files:"
+          ls -lah
+          echo ""
+          echo "Find output.txt:"
+          find . -name "output.txt"
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-file
+          path: output.txt
+          if-no-files-found: warn
