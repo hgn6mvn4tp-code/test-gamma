@@ -15,8 +15,8 @@ except ImportError:
 # SETTINGS — edit these directly, no command-line flags needed
 # ============================================================
 N_MARKETS = 70               # how many 5-min windows to watch before stopping
-HIGH_THRESHOLD = 0.80         # side that reaches this first becomes "determining"
-LOW_THRESHOLD = 0.55          # determining side falling back to this = live failure
+HIGH_THRESHOLD = 0.70         # side that reaches this first becomes "determining"
+LOW_THRESHOLD = 0.35          # determining side falling back to this = live failure
 USE_WEBSOCKET = True          # False = REST polling instead
 VERBOSE = False               # False = only print per-window verdicts, not every tick
 OUTPUT_FILE = "output.txt"    # every print also gets written here
