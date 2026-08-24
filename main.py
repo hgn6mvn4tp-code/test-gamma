@@ -16,7 +16,7 @@ except ImportError:
 # ============================================================
 N_MARKETS = 70               # how many 5-min windows to watch before stopping
 HIGH_THRESHOLD = 0.70         # side that reaches this first becomes "determining"
-SUCCESS_THRESHOLD = 0.96      # determining side reaching this = success
+SUCCESS_THRESHOLD = 0.97      # determining side reaching this = success
 LOW_THRESHOLD = 0.2            # determining side falling back to this before success = failure
 USE_WEBSOCKET = True          # False = REST polling instead
 VERBOSE = False               # False = only print per-window verdicts, not every tick
