@@ -14,13 +14,16 @@ except ImportError:
 # ============================================================
 # SETTINGS — edit these directly, no command-line flags needed
 # ============================================================
-N_MARKETS = 70               # how many 5-min windows to watch before stopping
-HIGH_THRESHOLD = 0.37         # side that reaches this first becomes "determining"
-SUCCESS_THRESHOLD = 0.63      # determining side reaching this = success
-LOW_THRESHOLD = 0.14            # determining side falling back to this before success = failure
-USE_WEBSOCKET = True          # False = REST polling instead
-VERBOSE = False               # False = only print per-window verdicts, not every tick
-OUTPUT_FILE = "output.txt"    # every print also gets written here
+N_MARKETS = 70                 # how many 5-min windows to watch before stopping
+HIGH_THRESHOLD = 0.70           # side that reaches this first becomes "determining"
+LOW_THRESHOLD = 0.25            # determining side falling back to this = live stop-loss failure
+USE_WEBSOCKET = True            # False = REST polling instead
+VERBOSE = False                 # False = only print per-window verdicts, not every tick
+OUTPUT_FILE = "output.txt"      # every print also gets written here
+WAIT_BEFORE_RESOLUTION_SECONDS = 330  # ~5.5 min buffer after the last window closes, so every
+                                       # market (especially the last one) has had time to resolve
+RESOLUTION_RETRIES = 4          # how many times to re-check a market's outcome if not resolved yet
+RESOLUTION_RETRY_DELAY = 15     # seconds between resolution re-checks
 # ============================================================
 
 
@@ -90,23 +93,58 @@ def parse_outcomes(market: dict) -> dict:
     return out
 
 
+def fetch_final_outcome(slug: str):
+    """Looks up the resolved outcome for a market straight from Gamma's
+    outcomePrices, e.g. outcomes=["Up","Down"], outcomePrices=["0","1"]
+    means "Down" won (its price settled at 1). Retries a few times in
+    case the market hasn't fully resolved yet. Returns 'Up' / 'Down' /
+    None (still unresolved / not found)."""
+    for attempt in range(RESOLUTION_RETRIES):
+        try:
+            market = None
+            r = requests.get(f"{GAMMA_API}/markets", params={"slug": slug}, timeout=10)
+            if r.ok and r.json():
+                market = r.json()[0]
+            else:
+                r2 = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=10)
+                if r2.ok:
+                    events = r2.json()
+                    if events and events[0].get("markets"):
+                        market = events[0]["markets"][0]
+
+            if market:
+                outcomes = json.loads(market["outcomes"])
+                prices = json.loads(market.get("outcomePrices", "[]") or "[]")
+                if prices and len(prices) == len(outcomes):
+                    for name, p in zip(outcomes, prices):
+                        if float(p) >= 0.5:
+                            return name  # settled at (or near) 1 = the winning outcome
+        except Exception:
+            pass
+
+        if attempt < RESOLUTION_RETRIES - 1:
+            time.sleep(RESOLUTION_RETRY_DELAY)
+
+    return None
+
+
 class WindowClassifier:
     """Whichever side hits HIGH_THRESHOLD first becomes the 'determining'
-    side. After that, only that side matters:
-      - if it reaches SUCCESS_THRESHOLD -> success
-      - if it falls back to LOW_THRESHOLD before that -> failure
-      - if the window closes without hitting either -> failure
+    side. From then on, only that side matters:
+      - if it falls back to LOW_THRESHOLD -> immediate live failure (stop-loss)
+      - otherwise the window ends 'pending' real resolution: success only if
+        the determining side turns out to be the actual resolved outcome,
+        failure otherwise.
     If no side ever reaches HIGH_THRESHOLD, the window is 'undetermined'."""
 
-    def __init__(self, token_up, token_down, high_thresh, success_thresh, low_thresh):
+    def __init__(self, token_up, token_down, high_thresh, low_thresh):
         self.token_up = token_up
         self.token_down = token_down
         self.high = high_thresh
-        self.success_thresh = success_thresh
         self.low = low_thresh
         self.determining_token = None
         self.determining_side = None
-        self.status = None  # None | "success" | "failure"
+        self.status = None  # None | "failure" (live stop-loss hit)
         self.decided_at = None
 
     def update(self, token_id, price, ts):
@@ -122,21 +160,15 @@ class WindowClassifier:
         if token_id != self.determining_token:
             return  # only the determining side matters from here on
 
-        if price >= self.success_thresh:
-            self.status = "success"
-            self.decided_at = ts
-        elif price <= self.low:
+        if price <= self.low:
             self.status = "failure"
             self.decided_at = ts
 
-    def final_status(self):
-        """Status once the window has closed."""
+    def window_status(self):
+        """Status right after the window closes, before checking real resolution."""
         if self.status is not None:
-            return self.status  # "success" or "failure"
-        if self.determining_token is not None:
-            # reached HIGH_THRESHOLD but never hit success or the stop-loss
-            return "failure"
-        return "undetermined"
+            return self.status  # "failure" (stop-loss)
+        return "pending" if self.determining_token is not None else "undetermined"
 
 
 def stream_window_ws(outcomes, close_ts, classifier, label):
@@ -266,9 +298,21 @@ def wait_for_window(target_ts, label):
             print(f"[{ts_now()}] {label} ...still waiting, {int(remaining)}s left")
 
 
+def wait_seconds(seconds, note):
+    """Sleeps for `seconds`, printing progress every ~15s so it's never silent."""
+    print(f"{note} — waiting {int(seconds)}s...")
+    remaining = seconds
+    while remaining > 0:
+        chunk = min(15, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0:
+            print(f"[{ts_now()}] ...still waiting, {int(remaining)}s left")
+
+
 def analyze():
     print(f"[{ts_now()}] Starting analysis of {N_MARKETS} markets "
-          f"(trigger>={HIGH_THRESHOLD}, success>={SUCCESS_THRESHOLD}, stop-loss<={LOW_THRESHOLD})")
+          f"(trigger>={HIGH_THRESHOLD}, stop-loss<={LOW_THRESHOLD})")
 
     records = []  # list of dicts: slug, label, determining_side, status
 
@@ -297,8 +341,7 @@ def analyze():
         print(f"[{ts_now()}] {label} Down token: {outcomes['Down']['token_id']}")
 
         classifier = WindowClassifier(
-            outcomes["Up"]["token_id"], outcomes["Down"]["token_id"],
-            HIGH_THRESHOLD, SUCCESS_THRESHOLD, LOW_THRESHOLD
+            outcomes["Up"]["token_id"], outcomes["Down"]["token_id"], HIGH_THRESHOLD, LOW_THRESHOLD
         )
         if outcomes["Up"]["price"] is not None:
             classifier.update(outcomes["Up"]["token_id"], outcomes["Up"]["price"], time.time())
@@ -314,19 +357,16 @@ def analyze():
         else:
             stream_window_poll(outcomes, close_ts, classifier, label)
 
-        status = classifier.final_status()
+        status = classifier.window_status()
         determining = f" (determining side: {classifier.determining_side})" if classifier.determining_side else ""
 
-        if status == "success":
-            print(f"[{ts_now()}] {label} >>> RESULT: SUCCESS{determining} (hit {SUCCESS_THRESHOLD}) <<<")
-        elif status == "failure":
-            if classifier.decided_at is not None:
-                print(f"[{ts_now()}] {label} >>> RESULT: FAILURE{determining} (stop-loss hit) <<<")
-            else:
-                print(f"[{ts_now()}] {label} >>> RESULT: FAILURE{determining} "
-                      f"(window closed without reaching {SUCCESS_THRESHOLD}) <<<")
-        else:
+        if status == "failure":
+            print(f"[{ts_now()}] {label} >>> RESULT: FAILURE{determining} (stop-loss hit) <<<")
+        elif status == "undetermined":
             print(f"[{ts_now()}] {label} >>> RESULT: UNDETERMINED (never reached {HIGH_THRESHOLD}) <<<")
+        else:
+            print(f"[{ts_now()}] {label} window closed, never hit stop-loss{determining} "
+                  f"-> pending real resolution")
 
         records.append({
             "slug": slug,
@@ -335,22 +375,65 @@ def analyze():
             "status": status,
         })
 
-    return [(r["status"], r["slug"]) for r in records]
+    # ------------------------------------------------------------
+    # Wait a buffer period so every window (especially the last one)
+    # has had time to actually resolve on-chain before we check outcomes.
+    # ------------------------------------------------------------
+    print(f"\n[{ts_now()}] All {N_MARKETS} windows done.")
+    wait_seconds(WAIT_BEFORE_RESOLUTION_SECONDS, f"[{ts_now()}] Pausing before checking outcomes")
+
+    # ------------------------------------------------------------
+    # Second pass: look up the real resolved outcome for every market
+    # that reached a determining side, and print determining vs outcome
+    # side by side.
+    # ------------------------------------------------------------
+    print(f"\n[{ts_now()}] Checking real outcomes...")
+    for r in records:
+        if r["status"] == "undetermined":
+            print(f"[{ts_now()}] {r['label']} determining={'-':10s} outcome={'-':10s} -> UNDETERMINED (market never found)")
+            continue
+
+        outcome = fetch_final_outcome(r["slug"])
+        r["outcome"] = outcome
+        det = r["determining_side"] or "-"
+
+        if r["status"] == "failure":
+            # already failed live via stop-loss, regardless of the real outcome
+            print(f"[{ts_now()}] {r['label']} determining={det:10s} outcome={outcome or 'UNKNOWN':10s} "
+                  f"-> FAILURE (stop-loss hit)")
+            continue
+
+        # status == "pending": decide success/failure from the real outcome
+        if outcome is None:
+            r["status"] = "undetermined"
+            print(f"[{ts_now()}] {r['label']} determining={det:10s} outcome={'UNKNOWN':10s} -> UNDETERMINED (unresolved)")
+        elif outcome == r["determining_side"]:
+            r["status"] = "success"
+            print(f"[{ts_now()}] {r['label']} determining={det:10s} outcome={outcome:10s} -> SUCCESS")
+        else:
+            r["status"] = "failure"
+            print(f"[{ts_now()}] {r['label']} determining={det:10s} outcome={outcome:10s} -> FAILURE (wrong side)")
+
+    return records
 
 
-def summarize(results):
-    total = len(results)
-    successes = sum(1 for s, _ in results if s == "success")
-    failures = sum(1 for s, _ in results if s == "failure")
-    undetermined = sum(1 for s, _ in results if s == "undetermined")
+def summarize(records):
+    total = len(records)
+    successes = sum(1 for r in records if r["status"] == "success")
+    failures = sum(1 for r in records if r["status"] == "failure")
+    undetermined = sum(1 for r in records if r["status"] == "undetermined")
     decided = successes + failures
 
-    print("\n" + "=" * 55)
+    print("\n" + "=" * 70)
     print("SUMMARY")
-    print("=" * 55)
-    for status, slug in results:
-        print(f"  {status.upper():13s} {slug}")
-    print("-" * 55)
+    print("=" * 70)
+    print(f"  {'STATUS':13s} {'DETERMINING':12s} {'OUTCOME':10s} SLUG")
+    print("-" * 70)
+    for r in records:
+        det = r.get("determining_side") or "-"
+        out = r.get("outcome") or "-"
+        print(f"  {r['status'].upper():13s} {det:12s} {out:10s} {r['slug']}")
+    print("-" * 70)
     print(f"Markets watched:  {total}")
     print(f"  Success:        {successes}")
     print(f"  Failure:        {failures}")
@@ -360,15 +443,15 @@ def summarize(results):
         print(f"\nSuccess rate (of decided markets): {prob:.4f}  ({prob*100:.2f}%)")
     else:
         print("\nNo decided markets to compute a success rate from.")
-    print("=" * 55)
+    print("=" * 70)
 
 
 if __name__ == "__main__":
     tee = Tee(OUTPUT_FILE, sys.stdout)
     sys.stdout = tee
     try:
-        results = analyze()
-        summarize(results)
+        records = analyze()
+        summarize(records)
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
